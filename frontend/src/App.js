@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { Container, Row, Col, Form, Button, Alert, Spinner, ListGroup, Card } from 'react-bootstrap';
+import { Container, Row, Col, Form, Button, Alert, Spinner, ListGroup, Card, OverlayTrigger, Tooltip } from 'react-bootstrap';
 import 'bootstrap/dist/css/bootstrap.min.css';
 
 function App() {
@@ -13,6 +13,10 @@ function App() {
   const [files, setFiles] = useState([]);
   const [successMessage, setSuccessMessage] = useState('');
   const [audioResults, setAudioResults] = useState([]);
+  const textareaRef = useRef(null);
+  const [serverUrl] = useState(
+    window.location.hostname === 'localhost' ? 'http://localhost:5000' : window.location.origin
+  );
 
   // Fetch list of voices from Amazon Polly when component loads
   useEffect(() => {
@@ -58,6 +62,31 @@ function App() {
     setFiles(selectedFiles);
   };
 
+  const handleInsertSeparator = () => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    const cursorPosition = textarea.selectionStart;
+    const textBeforeCursor = text.substring(0, cursorPosition);
+    const textAfterCursor = text.substring(cursorPosition);
+    
+    // Add a newline before the separator if not at beginning of line
+    const prefix = cursorPosition > 0 && text[cursorPosition - 1] !== '\n' ? '\n' : '';
+    
+    // Insert separator template
+    const separator = `${prefix}---------- [put your output file name here]\n`;
+    const newText = textBeforeCursor + separator + textAfterCursor;
+    setText(newText);
+    
+    // Focus back on textarea and place cursor after the inserted separator
+    setTimeout(() => {
+      textarea.focus();
+      const placeholderStart = cursorPosition + prefix.length + 11; // "---------- ".length
+      const placeholderEnd = placeholderStart + 32; // "[put your output file name here]".length
+      textarea.setSelectionRange(placeholderStart, placeholderEnd);
+    }, 0);
+  };
+
   const handleTextSubmit = async (e) => {
     e.preventDefault();
     
@@ -81,8 +110,33 @@ function App() {
         languageCode: selectedVoiceObj ? selectedVoiceObj.language : 'en-US'
       });
 
-      setSuccessMessage('Audio generated successfully!');
-      setAudioUrl(response.data.url);
+      if (response.data.multipart && response.data.results) {
+        setSuccessMessage(`Successfully converted ${response.data.results.length} sections to speech!`);
+        setAudioResults(response.data.results.map(result => ({
+          originalFilename: result.name,
+          audioFilename: result.filename,
+          url: result.url,
+          downloadUrl: result.downloadUrl
+        })));
+      } else {
+        setSuccessMessage('Audio generated successfully!');
+        setAudioUrl(response.data.url);
+        // Store download URL if available
+        if (response.data.downloadUrl) {
+          setAudioResults([{
+            originalFilename: 'Audio',
+            audioFilename: response.data.filename,
+            url: response.data.url,
+            downloadUrl: response.data.downloadUrl
+          }]);
+        }
+      }
+
+      // Display any errors that occurred during processing
+      if (response.data.errors && response.data.errors.length > 0) {
+        const errorMessages = response.data.errors.map(err => `${err.name}: ${err.error}`).join('\n');
+        setError(`Some sections could not be processed:\n${errorMessages}`);
+      }
     } catch (err) {
       console.error('Error generating speech:', err);
       setError(err.response?.data?.error || 'Failed to generate speech. Please try again.');
@@ -126,21 +180,50 @@ function App() {
         }
       });
 
+      let totalAudioCount = 0;
+      const processedResults = [];
+
       if (response.data.results && response.data.results.length > 0) {
-        setSuccessMessage(`Successfully converted ${response.data.results.length} file(s) to speech!`);
-        setAudioResults(response.data.results);
+        response.data.results.forEach(result => {
+          if (result.hasParts && result.parts) {
+            // Handle multi-part file
+            result.parts.forEach(part => {
+              processedResults.push({
+                originalFilename: `${result.originalFilename} - ${part.partName}`,
+                audioFilename: part.audioFilename,
+                url: part.url,
+                downloadUrl: part.downloadUrl
+              });
+            });
+            totalAudioCount += result.parts.length;
+          } else {
+            // Handle single file
+            processedResults.push({
+              originalFilename: result.originalFilename,
+              audioFilename: result.audioFilename,
+              url: result.url,
+              downloadUrl: result.downloadUrl
+            });
+            totalAudioCount += 1;
+          }
+        });
+
+        setSuccessMessage(`Successfully converted ${totalAudioCount} audio files!`);
+        setAudioResults(processedResults);
       } else {
         setSuccessMessage('Audio generated successfully!');
       }
 
       // If there's only one result, also set the audioUrl for compatibility with the single player
-      if (response.data.results && response.data.results.length === 1) {
-        setAudioUrl(response.data.results[0].url);
+      if (processedResults.length === 1) {
+        setAudioUrl(processedResults[0].url);
       }
 
       // Display any errors that occurred during processing
       if (response.data.errors && response.data.errors.length > 0) {
-        const errorMessages = response.data.errors.map(err => `${err.filename}: ${err.error}`).join('\n');
+        const errorMessages = response.data.errors.map(err => 
+          `${err.filename}${err.partName ? ' - ' + err.partName : ''}: ${err.error}`
+        ).join('\n');
         setError(`Some files could not be processed:\n${errorMessages}`);
       }
     } catch (err) {
@@ -149,6 +232,19 @@ function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // Helper function to ensure download URLs have the proper extension
+  const formatDownloadUrl = (url) => {
+    if (!url) return '';
+    
+    // If URL already has a file extension, return as is
+    if (url.match(/\.(mp3|wav|ogg)$/i)) {
+      return url;
+    }
+    
+    // Add .mp3 extension for download URLs
+    return `${url}`;
   };
 
   return (
@@ -182,13 +278,34 @@ function App() {
             <h4>Convert Text to Speech</h4>
             <Form.Group className="mb-3">
               <Form.Label>Enter Text</Form.Label>
+              <div className="mb-2">
+                <OverlayTrigger
+                  placement="top"
+                  overlay={<Tooltip>Insert separator for multiple outputs. Format: "---------- [output filename]"</Tooltip>}
+                >
+                  <Button 
+                    variant="outline-secondary" 
+                    size="sm"
+                    onClick={handleInsertSeparator}
+                  >
+                    Insert Section Separator
+                  </Button>
+                </OverlayTrigger>
+                <span className="text-muted ms-2 small">
+                  Use separator to create multiple audio files
+                </span>
+              </div>
               <Form.Control
                 as="textarea"
                 rows={5}
                 value={text}
                 onChange={handleTextChange}
                 placeholder="Enter the text you want to convert to speech..."
+                ref={textareaRef}
               />
+              <Form.Text className="text-muted">
+                Use "---------- section_name" to split your text into multiple audio files.
+              </Form.Text>
             </Form.Group>
 
             <Form.Group className="mb-3">
@@ -232,6 +349,7 @@ function App() {
               />
               <Form.Text className="text-muted">
                 Multiple .txt files are supported. Each file will be converted to a separate audio file.
+                Files can also contain separators ("---------- section_name") to create multiple outputs per file.
               </Form.Text>
             </Form.Group>
 
@@ -273,7 +391,15 @@ function App() {
                 Your browser does not support the audio element.
               </audio>
               <div className="mt-2">
-                <Button variant="outline-primary" href={audioUrl} download>
+                <Button 
+                  variant="outline-primary" 
+                  href={
+                    serverUrl + formatDownloadUrl(
+                      audioUrl.replace('/api/audio/', '/api/download/')
+                    )
+                  }
+                  download
+                >
                   Download Audio
                 </Button>
               </div>
@@ -295,7 +421,11 @@ function App() {
                       <audio controls className="w-100 mt-2 mb-2" src={result.url}>
                         Your browser does not support the audio element.
                       </audio>
-                      <Button variant="outline-primary" href={result.url} download={result.audioFilename}>
+                      <Button 
+                        variant="outline-primary" 
+                        href={serverUrl + formatDownloadUrl(result.downloadUrl || result.url.replace('/api/audio/', '/api/download/'))}
+                        download={result.audioFilename || "audio.mp3"}
+                      >
                         Download Audio
                       </Button>
                     </Card.Body>

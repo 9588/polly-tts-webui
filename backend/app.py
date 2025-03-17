@@ -3,8 +3,10 @@ import configparser
 import uuid
 import logging
 import traceback
+import re
+import json
 import urllib.parse
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 import boto3
 from werkzeug.utils import secure_filename
@@ -44,9 +46,36 @@ output_folder = config.get('APP', 'output_folder')
 allowed_extensions = config.get('APP', 'allowed_extensions').split(',')
 max_text_length = int(config.get('APP', 'max_text_length'))
 
+# File mapping database (mapping between stored files and download filenames)
+file_mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'file_mapping.json')
+
 # Create directories if they don't exist
 os.makedirs(upload_folder, exist_ok=True)
 os.makedirs(output_folder, exist_ok=True)
+
+# Initialize file mapping if it doesn't exist
+if not os.path.exists(file_mapping_path):
+    with open(file_mapping_path, 'w') as f:
+        json.dump({}, f)
+
+def get_file_mapping():
+    """Read the file mapping from disk"""
+    try:
+        with open(file_mapping_path, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_file_mapping(mapping):
+    """Save the file mapping to disk"""
+    with open(file_mapping_path, 'w') as f:
+        json.dump(mapping, f)
+
+def add_file_mapping(stored_filename, display_filename):
+    """Add a new entry to the file mapping"""
+    mapping = get_file_mapping()
+    mapping[stored_filename] = display_filename
+    save_file_mapping(mapping)
 
 # Initialize Polly client with better error handling
 try:
@@ -65,6 +94,58 @@ except Exception as e:
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
+
+# Function to split text by separator and extract file names
+def split_text_by_separator(text):
+    parts = []
+    current_text = ""
+    current_name = None
+    
+    # Split the text by newlines to process line by line
+    lines = text.split('\n')
+    
+    for line in lines:
+        # Check if this is a separator line
+        if line.strip().startswith('----------'):
+            # If we've already been collecting text, save it as a part
+            if current_name is not None and current_text:
+                parts.append({
+                    'text': current_text.strip(),
+                    'name': current_name
+                })
+                current_text = ""
+            
+            # Extract name from the separator line
+            separator_match = re.match(r'^----------\s*(.*?)$', line.strip())
+            if separator_match:
+                name_part = separator_match.group(1).strip()
+                current_name = name_part if name_part else f"part_{len(parts) + 1}"
+            else:
+                current_name = f"part_{len(parts) + 1}"
+        else:
+            # If we've encountered a separator, add to current text
+            if current_name is not None:
+                current_text += line + "\n"
+            # If text appears before any separator, create a default part
+            elif line.strip():
+                current_name = "intro"
+                current_text = line + "\n"
+    
+    # Don't forget to add the last part
+    if current_name is not None and current_text:
+        parts.append({
+            'text': current_text.strip(),
+            'name': current_name
+        })
+    
+    # If no valid parts were found, just use the original text
+    if not parts and text.strip():
+        parts = [{
+            'text': text.strip(),
+            'name': 'complete_text'
+        }]
+    
+    return parts
 
 @app.route('/api/voices', methods=['GET'])
 def get_voices(): 
@@ -92,11 +173,11 @@ def get_voices():
             'traceback': traceback.format_exc()
         }), 500
 
-# Rest of the application code remains the same
 @app.route('/api/synthesize', methods=['POST'])
 def synthesize_speech():
     """Convert text to speech using Amazon Polly"""
     try:
+        logger.info("Received request to synthesize speech")
         data = request.get_json()
         
         if not data or 'text' not in data:
@@ -106,31 +187,102 @@ def synthesize_speech():
         voice_id = data.get('voiceId', voice_id_english)
         language_code = data.get('languageCode', 'en-US')
         
-        if len(text) > max_text_length:
-            return jsonify({'error': f'Text exceeds maximum length of {max_text_length} characters'}), 400
-        
-        # Generate a unique filename
-        filename = f"{uuid.uuid4()}.{output_format}"
-        output_path = os.path.join(output_folder, filename)
-        
-        # Call Amazon Polly to synthesize speech
-        response = polly_client.synthesize_speech(
-            Text=text,
-            VoiceId=voice_id,
-            LanguageCode=language_code,
-            OutputFormat=output_format
-        )
-        
-        # Save the audio to a file
-        if "AudioStream" in response:
-            with open(output_path, 'wb') as file:
-                file.write(response['AudioStream'].read())
-                
-        return jsonify({
-            'success': True,
-            'filename': filename,
-            'url': f'/api/audio/{filename}'
-        })
+        # Check if the text has separators
+        if '----------' in text: 
+            text_parts = split_text_by_separator(text)
+            logger.info(f"Splitting text into {len(text_parts)} parts")
+            logger.debug(f"Text parts: {text_parts}")
+            results = []
+            errors = []
+            
+            for part in text_parts:
+                try:
+                    if len(part['text']) > max_text_length:
+                        errors.append({
+                            'name': part['name'],
+                            'error': f"Text exceeds maximum length of {max_text_length} characters"
+                        })
+                        continue
+                    
+                    # Generate a unique internal filename
+                    unique_id = str(uuid.uuid4())
+                    internal_filename = f"{unique_id}.{output_format}"
+                    output_path = os.path.join(output_folder, internal_filename)
+                    
+                    # Generate a clean display filename for download
+                    clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', part['name'])
+                    display_filename = f"{clean_name}.{output_format}"
+                    
+                    # Call Amazon Polly to synthesize speech
+                    polly_response = polly_client.synthesize_speech(
+                        Text=part['text'],
+                        VoiceId=voice_id,
+                        LanguageCode=language_code,
+                        OutputFormat=output_format
+                    )
+                    
+                    # Save the audio to a file
+                    if "AudioStream" in polly_response:
+                        with open(output_path, 'wb') as file:
+                            file.write(polly_response['AudioStream'].read())
+                    
+                    # Save mapping between internal and display filenames
+                    add_file_mapping(internal_filename, display_filename)
+                    
+                    results.append({
+                        'name': part['name'],
+                        'filename': display_filename,
+                        'url': f'/api/audio/{internal_filename}',
+                        'downloadUrl': f'/api/download/{internal_filename}'
+                    })
+                except Exception as e:
+                    logger.error(f"Error synthesizing part {part['name']}: {str(e)}")
+                    errors.append({
+                        'name': part['name'],
+                        'error': str(e)
+                    })
+            
+            return jsonify({
+                'success': True,
+                'results': results,
+                'errors': errors,
+                'multipart': True
+            })
+        else:
+            # Original single text processing
+            if len(text) > max_text_length:
+                return jsonify({'error': f'Text exceeds maximum length of {max_text_length} characters'}), 400
+            
+            # Generate a unique internal filename
+            unique_id = str(uuid.uuid4())
+            internal_filename = f"{unique_id}.{output_format}"
+            output_path = os.path.join(output_folder, internal_filename)
+            
+            # Generate a clean display filename for download
+            display_filename = f"audio.{output_format}"
+            
+            # Call Amazon Polly to synthesize speech
+            response = polly_client.synthesize_speech(
+                Text=text,
+                VoiceId=voice_id,
+                LanguageCode=language_code,
+                OutputFormat=output_format
+            )
+            
+            # Save the audio to a file
+            if "AudioStream" in response:
+                with open(output_path, 'wb') as file:
+                    file.write(response['AudioStream'].read())
+            
+            # Save mapping between internal and display filenames
+            add_file_mapping(internal_filename, display_filename)
+                    
+            return jsonify({
+                'success': True,
+                'filename': display_filename,
+                'url': f'/api/audio/{internal_filename}',
+                'downloadUrl': f'/api/download/{internal_filename}'
+            })
         
     except Exception as e:
         logger.error(f"Error synthesizing speech: {str(e)}")
@@ -139,9 +291,69 @@ def synthesize_speech():
 
 @app.route('/api/audio/<filename>', methods=['GET'])
 def get_audio(filename):
-    """Serve the generated audio file"""
+    """Serve the generated audio file for playback (not download)"""
     return send_from_directory(os.path.abspath(output_folder), filename)
-    
+
+@app.route('/api/download/<path:filename>', methods=['GET'])
+def download_audio(filename):
+    """Download the audio file with the correct filename"""
+    try:
+        logger.info(f"Download request for file: {filename}")
+        
+        # Get the mapping to find the display filename
+        mapping = get_file_mapping()
+        
+        # Remove any file extension for lookup purposes
+        base_filename = filename.split('.')[0] if '.' in filename else filename
+        
+        # Look for the file with extension in the output directory
+        stored_filename = None
+        display_filename = None
+        
+        # First try exact match
+        if filename in mapping:
+            stored_filename = filename
+            display_filename = mapping[filename]
+        else:
+            # Try to find a match based on the basename (without extension)
+            for stored_name, display_name in mapping.items():
+                stored_base = stored_name.split('.')[0] if '.' in stored_name else stored_name
+                if stored_base == base_filename:
+                    stored_filename = stored_name
+                    display_filename = display_name
+                    break
+        
+        if not stored_filename:
+            # If we still don't have a match, check if the file exists with .mp3 extension
+            if os.path.exists(os.path.join(output_folder, f"{base_filename}.{output_format}")):
+                stored_filename = f"{base_filename}.{output_format}"
+                display_filename = stored_filename  # Use the same name if no mapping found
+        
+        if not stored_filename:
+            logger.error(f"No matching file found for: {filename}")
+            return jsonify({'error': 'File not found'}), 404
+        
+        # Full path to the stored file
+        file_path = os.path.join(os.path.abspath(output_folder), stored_filename)
+        
+        if not os.path.exists(file_path):
+            logger.error(f"File path doesn't exist: {file_path}")
+            return jsonify({'error': 'File not found'}), 404
+        
+        logger.info(f"Sending file {stored_filename} as {display_filename}")
+        
+        # Send the file with the display filename for download
+        return send_file(
+            file_path,
+            mimetype=f'audio/{output_format}',
+            as_attachment=True,
+            download_name=display_filename
+        )
+    except Exception as e:
+        logger.error(f"Error downloading file {filename}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f"File not found or error downloading: {str(e)}"}), 404
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     """Upload a text file and convert it to speech"""
@@ -169,29 +381,93 @@ def upload_file():
                 with open(file_path, 'r', encoding='utf-8') as f:
                     text = f.read()
                 
-                # Get base name without extension for output file
-                base_name = os.path.splitext(filename)[0]
-                audio_filename = f"{base_name}.{output_format}"
-                output_path = os.path.join(output_folder, audio_filename)
-                
-                # Call Amazon Polly to synthesize speech
-                response = polly_client.synthesize_speech(
-                    Text=text,
-                    VoiceId=voice_id,
-                    LanguageCode=language_code,
-                    OutputFormat=output_format
-                )
-                
-                # Save the audio to a file
-                if "AudioStream" in response:
-                    with open(output_path, 'wb') as audio_file:
-                        audio_file.write(response['AudioStream'].read())
-                        
-                results.append({
-                    'originalFilename': filename,
-                    'audioFilename': audio_filename,
-                    'url': f'/api/audio/{audio_filename}'
-                })
+                # Check if file contains separators
+                if '----------' in text:
+                    text_parts = split_text_by_separator(text)
+                    file_results = []
+                    
+                    for part in text_parts:
+                        try:
+                            # Generate a unique internal filename
+                            unique_id = str(uuid.uuid4())
+                            internal_filename = f"{unique_id}.{output_format}"
+                            output_path = os.path.join(output_folder, internal_filename)
+                            
+                            # Generate a clean display filename for download
+                            base_name = os.path.splitext(filename)[0]
+                            clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', part['name'])
+                            display_filename = f"{base_name}_{clean_name}.{output_format}"
+                            
+                            # Call Amazon Polly to synthesize speech
+                            response = polly_client.synthesize_speech(
+                                Text=part['text'],
+                                VoiceId=voice_id,
+                                LanguageCode=language_code,
+                                OutputFormat=output_format
+                            )
+                            
+                            # Save the audio to a file
+                            if "AudioStream" in response:
+                                with open(output_path, 'wb') as audio_file:
+                                    audio_file.write(response['AudioStream'].read())
+                                    
+                            # Save mapping between internal and display filenames
+                            add_file_mapping(internal_filename, display_filename)
+                            
+                            file_results.append({
+                                'partName': part['name'],
+                                'audioFilename': display_filename,
+                                'url': f'/api/audio/{internal_filename}',
+                                'downloadUrl': f'/api/download/{internal_filename}'
+                            })
+                        except Exception as e:
+                            logger.error(f"Error converting part {part['name']} of file {filename} to speech: {str(e)}")
+                            errors.append({
+                                'filename': filename,
+                                'partName': part['name'],
+                                'error': str(e)
+                            })
+                    
+                    if file_results:
+                        results.append({
+                            'originalFilename': filename,
+                            'parts': file_results,
+                            'hasParts': True
+                        })
+                else:
+                    # Regular file processing (one file -> one audio)
+                    # Generate a unique internal filename
+                    unique_id = str(uuid.uuid4())
+                    internal_filename = f"{unique_id}.{output_format}"
+                    output_path = os.path.join(output_folder, internal_filename)
+                    
+                    # Generate a clean display filename for download
+                    base_name = os.path.splitext(filename)[0]
+                    display_filename = f"{base_name}.{output_format}"
+                    
+                    # Call Amazon Polly to synthesize speech
+                    response = polly_client.synthesize_speech(
+                        Text=text,
+                        VoiceId=voice_id,
+                        LanguageCode=language_code,
+                        OutputFormat=output_format
+                    )
+                    
+                    # Save the audio to a file
+                    if "AudioStream" in response:
+                        with open(output_path, 'wb') as audio_file:
+                            audio_file.write(response['AudioStream'].read())
+                    
+                    # Save mapping between internal and display filenames
+                    add_file_mapping(internal_filename, display_filename)
+                            
+                    results.append({
+                        'originalFilename': filename,
+                        'audioFilename': display_filename,
+                        'url': f'/api/audio/{internal_filename}',
+                        'downloadUrl': f'/api/download/{internal_filename}',
+                        'hasParts': False
+                    })
             except Exception as e:
                 logger.error(f"Error converting file {filename} to speech: {str(e)}")
                 logger.error(traceback.format_exc())
@@ -241,10 +517,14 @@ def upload_multiple_files():
                 with open(file_path, 'r', encoding='utf-8') as f:
                     text = f.read()
                 
-                # Get base name without extension for output file
+                # Generate a unique internal filename
+                unique_id = str(uuid.uuid4())
+                internal_filename = f"{unique_id}.{output_format}"
+                output_path = os.path.join(output_folder, internal_filename)
+                
+                # Generate a clean display filename for download
                 base_name = os.path.splitext(filename)[0]
-                audio_filename = f"{base_name}.{output_format}"
-                output_path = os.path.join(output_folder, audio_filename)
+                display_filename = f"{base_name}.{output_format}"
                 
                 # Call Amazon Polly to synthesize speech
                 response = polly_client.synthesize_speech(
@@ -258,11 +538,15 @@ def upload_multiple_files():
                 if "AudioStream" in response:
                     with open(output_path, 'wb') as audio_file:
                         audio_file.write(response['AudioStream'].read())
+                
+                # Save mapping between internal and display filenames
+                add_file_mapping(internal_filename, display_filename)
                         
                 results.append({
                     'originalFilename': filename,
-                    'audioFilename': audio_filename,
-                    'url': f'/api/audio/{audio_filename}'
+                    'audioFilename': display_filename,
+                    'url': f'/api/audio/{internal_filename}',
+                    'downloadUrl': f'/api/download/{internal_filename}'
                 })
             except Exception as e:
                 logger.error(f"Error converting file {filename} to speech: {str(e)}")
