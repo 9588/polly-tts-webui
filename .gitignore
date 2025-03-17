@@ -2,3 +2,4 @@ config/config.ini
 frontend/node_modules
 uploads/
 outputs/
+backend/file_mapping.json
