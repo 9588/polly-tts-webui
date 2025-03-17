@@ -1,0 +1,19 @@
+.App {
+  text-align: center;
+}
+
+.app-header {
+  background-color: #282c34;
+  padding: 20px;
+  color: white;
+  margin-bottom: 30px;
+}
+
+.audio-player {
+  margin: 20px 0;
+  width: 100%;
+}
+
+.form-container {
+  margin-bottom: 30px;
+}
