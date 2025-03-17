@@ -21,7 +21,7 @@ This is a web application that uses Amazon's Polly service to convert text to sp
 
 ### 1. Configure AWS Credentials
 
-Edit the `config/config.ini` file and add your AWS credentials:
+Copy the file `config/templete_config.ini` to `config/config.ini` and add your AWS credentials:
 
 ```ini
 [AWS]
