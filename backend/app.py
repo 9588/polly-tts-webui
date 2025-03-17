@@ -148,52 +148,143 @@ def upload_file():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
     
-    file = request.files['file']
-    if file.filename == '':
+    files = request.files.getlist('file')
+    if not files or files[0].filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        file_path = os.path.join(upload_folder, filename)
-        file.save(file_path)
-        
-        # Read text from the file
-        with open(file_path, 'r', encoding='utf-8') as f:
-            text = f.read()
+    results = []
+    errors = []
+    
+    voice_id = request.form.get('voiceId', voice_id_english)
+    language_code = request.form.get('languageCode', 'en-US')
+    
+    for file in files:
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(upload_folder, filename)
+            file.save(file_path)
             
-        # Get other parameters from form data
-        voice_id = request.form.get('voiceId', voice_id_english)
-        language_code = request.form.get('languageCode', 'en-US')
-        
-        # Generate a unique filename for the audio
-        audio_filename = f"{uuid.uuid4()}.{output_format}"
-        output_path = os.path.join(output_folder, audio_filename)
-        
-        # Call Amazon Polly to synthesize speech
-        try:
-            response = polly_client.synthesize_speech(
-                Text=text,
-                VoiceId=voice_id,
-                LanguageCode=language_code,
-                OutputFormat=output_format
-            )
-            
-            # Save the audio to a file
-            if "AudioStream" in response:
-                with open(output_path, 'wb') as file:
-                    file.write(response['AudioStream'].read())
-                    
-            return jsonify({
-                'success': True,
-                'filename': audio_filename,
-                'url': f'/api/audio/{audio_filename}'
+            # Read text from the file
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                
+                # Get base name without extension for output file
+                base_name = os.path.splitext(filename)[0]
+                audio_filename = f"{base_name}.{output_format}"
+                output_path = os.path.join(output_folder, audio_filename)
+                
+                # Call Amazon Polly to synthesize speech
+                response = polly_client.synthesize_speech(
+                    Text=text,
+                    VoiceId=voice_id,
+                    LanguageCode=language_code,
+                    OutputFormat=output_format
+                )
+                
+                # Save the audio to a file
+                if "AudioStream" in response:
+                    with open(output_path, 'wb') as audio_file:
+                        audio_file.write(response['AudioStream'].read())
+                        
+                results.append({
+                    'originalFilename': filename,
+                    'audioFilename': audio_filename,
+                    'url': f'/api/audio/{audio_filename}'
+                })
+            except Exception as e:
+                logger.error(f"Error converting file {filename} to speech: {str(e)}")
+                logger.error(traceback.format_exc())
+                errors.append({
+                    'filename': filename,
+                    'error': str(e)
+                })
+        else:
+            errors.append({
+                'filename': file.filename,
+                'error': 'File type not allowed'
             })
-        except Exception as e:
-            logger.error(f"Error converting file to speech: {str(e)}")
-            logger.error(traceback.format_exc())
-            return jsonify({'error': str(e)}), 500
+    
+    if not results and errors:
+        return jsonify({'error': 'All files failed to process', 'details': errors}), 500
+        
+    return jsonify({
+        'success': True,
+        'results': results,
+        'errors': errors
+    })
+
+@app.route('/api/upload-multiple', methods=['POST'])
+def upload_multiple_files():
+    """Upload multiple text files and convert them to speech"""
+    if 'files[]' not in request.files:
+        return jsonify({'error': 'No files part'}), 400
+    
+    files = request.files.getlist('files[]')
+    if not files or files[0].filename == '':
+        return jsonify({'error': 'No selected files'}), 400
+    
+    results = []
+    errors = []
+    
+    voice_id = request.form.get('voiceId', voice_id_english)
+    language_code = request.form.get('languageCode', 'en-US')
+    
+    for file in files:
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(upload_folder, filename)
+            file.save(file_path)
             
-    return jsonify({'error': 'File type not allowed'}), 400
+            # Read text from the file
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                
+                # Get base name without extension for output file
+                base_name = os.path.splitext(filename)[0]
+                audio_filename = f"{base_name}.{output_format}"
+                output_path = os.path.join(output_folder, audio_filename)
+                
+                # Call Amazon Polly to synthesize speech
+                response = polly_client.synthesize_speech(
+                    Text=text,
+                    VoiceId=voice_id,
+                    LanguageCode=language_code,
+                    OutputFormat=output_format
+                )
+                
+                # Save the audio to a file
+                if "AudioStream" in response:
+                    with open(output_path, 'wb') as audio_file:
+                        audio_file.write(response['AudioStream'].read())
+                        
+                results.append({
+                    'originalFilename': filename,
+                    'audioFilename': audio_filename,
+                    'url': f'/api/audio/{audio_filename}'
+                })
+            except Exception as e:
+                logger.error(f"Error converting file {filename} to speech: {str(e)}")
+                logger.error(traceback.format_exc())
+                errors.append({
+                    'filename': filename,
+                    'error': str(e)
+                })
+        else:
+            errors.append({
+                'filename': file.filename,
+                'error': 'File type not allowed'
+            })
+    
+    if not results and errors:
+        return jsonify({'error': 'All files failed to process', 'details': errors}), 500
+        
+    return jsonify({
+        'success': True,
+        'results': results,
+        'errors': errors
+    })
 
 # Serve React App
 @app.route('/', defaults={'path': ''})

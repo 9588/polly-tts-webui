@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { Container, Row, Col, Form, Button, Alert, Spinner } from 'react-bootstrap';
+import { Container, Row, Col, Form, Button, Alert, Spinner, ListGroup, Card } from 'react-bootstrap';
 import 'bootstrap/dist/css/bootstrap.min.css';
 
 function App() {
@@ -10,8 +10,9 @@ function App() {
   const [audioUrl, setAudioUrl] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [file, setFile] = useState(null);
+  const [files, setFiles] = useState([]);
   const [successMessage, setSuccessMessage] = useState('');
+  const [audioResults, setAudioResults] = useState([]);
 
   // Fetch list of voices from Amazon Polly when component loads
   useEffect(() => {
@@ -53,7 +54,8 @@ function App() {
   };
 
   const handleFileChange = (e) => {
-    setFile(e.target.files[0]);
+    const selectedFiles = Array.from(e.target.files);
+    setFiles(selectedFiles);
   };
 
   const handleTextSubmit = async (e) => {
@@ -68,6 +70,7 @@ function App() {
     setError('');
     setSuccessMessage('');
     setAudioUrl(null);
+    setAudioResults([]);
 
     try {
       const selectedVoiceObj = voices.find(voice => voice.id === selectedVoice);
@@ -91,8 +94,8 @@ function App() {
   const handleFileSubmit = async (e) => {
     e.preventDefault();
 
-    if (!file) {
-      setError('Please select a file to upload.');
+    if (!files.length) {
+      setError('Please select at least one file to upload.');
       return;
     }
 
@@ -100,10 +103,16 @@ function App() {
     setError('');
     setSuccessMessage('');
     setAudioUrl(null);
+    setAudioResults([]);
 
     try {
       const formData = new FormData();
-      formData.append('file', file);
+      
+      // Append all selected files
+      files.forEach(file => {
+        formData.append('file', file);  // Using 'file' as the key for compatibility with existing backend
+      });
+      
       formData.append('voiceId', selectedVoice);
       
       const selectedVoiceObj = voices.find(voice => voice.id === selectedVoice);
@@ -117,11 +126,26 @@ function App() {
         }
       });
 
-      setSuccessMessage('Audio generated successfully from file!');
-      setAudioUrl(response.data.url);
+      if (response.data.results && response.data.results.length > 0) {
+        setSuccessMessage(`Successfully converted ${response.data.results.length} file(s) to speech!`);
+        setAudioResults(response.data.results);
+      } else {
+        setSuccessMessage('Audio generated successfully!');
+      }
+
+      // If there's only one result, also set the audioUrl for compatibility with the single player
+      if (response.data.results && response.data.results.length === 1) {
+        setAudioUrl(response.data.results[0].url);
+      }
+
+      // Display any errors that occurred during processing
+      if (response.data.errors && response.data.errors.length > 0) {
+        const errorMessages = response.data.errors.map(err => `${err.filename}: ${err.error}`).join('\n');
+        setError(`Some files could not be processed:\n${errorMessages}`);
+      }
     } catch (err) {
-      console.error('Error generating speech from file:', err);
-      setError(err.response?.data?.error || 'Failed to generate speech from file. Please try again.');
+      console.error('Error generating speech from files:', err);
+      setError(err.response?.data?.error || 'Failed to generate speech from files. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -139,7 +163,7 @@ function App() {
       {error && (
         <Row className="mb-3">
           <Col>
-            <Alert variant="danger">{error}</Alert>
+            <Alert variant="danger" style={{ whiteSpace: 'pre-line' }}>{error}</Alert>
           </Col>
         </Row>
       )}
@@ -197,16 +221,17 @@ function App() {
 
         <Col md={6}>
           <Form onSubmit={handleFileSubmit}>
-            <h4>Upload Text File</h4>
+            <h4>Upload Text Files</h4>
             <Form.Group className="mb-3">
-              <Form.Label>Select Text File</Form.Label>
+              <Form.Label>Select Text Files</Form.Label>
               <Form.Control
                 type="file"
                 onChange={handleFileChange}
                 accept=".txt"
+                multiple
               />
               <Form.Text className="text-muted">
-                Only .txt files are supported.
+                Multiple .txt files are supported. Each file will be converted to a separate audio file.
               </Form.Text>
             </Form.Group>
 
@@ -232,14 +257,14 @@ function App() {
                   <span className="ms-2">Converting...</span>
                 </>
               ) : (
-                'Convert File to Speech'
+                'Convert Files to Speech'
               )}
             </Button>
           </Form>
         </Col>
       </Row>
 
-      {audioUrl && (
+      {audioUrl && !audioResults.length && (
         <Row className="mt-4">
           <Col>
             <h4>Generated Audio</h4>
@@ -253,6 +278,31 @@ function App() {
                 </Button>
               </div>
             </div>
+          </Col>
+        </Row>
+      )}
+
+      {audioResults.length > 0 && (
+        <Row className="mt-4">
+          <Col>
+            <h4>Generated Audio Files</h4>
+            <ListGroup>
+              {audioResults.map((result, index) => (
+                <ListGroup.Item key={index} className="p-3">
+                  <Card>
+                    <Card.Body>
+                      <Card.Title>{result.originalFilename}</Card.Title>
+                      <audio controls className="w-100 mt-2 mb-2" src={result.url}>
+                        Your browser does not support the audio element.
+                      </audio>
+                      <Button variant="outline-primary" href={result.url} download={result.audioFilename}>
+                        Download Audio
+                      </Button>
+                    </Card.Body>
+                  </Card>
+                </ListGroup.Item>
+              ))}
+            </ListGroup>
           </Col>
         </Row>
       )}
